@@ -1,0 +1,448 @@
+---
+title: "Final Project"
+author: "Eva Allred"
+date: "2023-12-08"
+output: html_document
+---
+## Background
+
+### Question
+In this project, I aim to explore what factors predict election turnout. This a very broad topic, so I will focus on a more limited version of it: what factors predict election turnout by county in the United States 2020 presidential election?  
+
+### Datasets And Citations
+To accomplish this analysis, I collected datasets on the county level from several sources and combined them (again, on the county level). To be more specific, I combined pieces of the following datasets:
+
+<ul>
+  <li>MIT Election Data and Science Lab, 2018, "County Presidential Election Returns 2000-2020", https://doi.org/10.7910/DVN/VOQCHQ, Harvard Dataverse, V11, UNF:6:HaZ8GWG8D2abLleXN3uEig== [fileUNF]</li>
+  <li>U.S. Census Bureau, "Citizen Voting Age Population by Race and Ethnicity",*American Community Survey, ACS 5-Year Estimates Detailed Tables*,2023, https://www.census.gov/programs-surveys/decennial-census/about/voting-rights/cvap.2020.html#list-tab-1518558936. Accessed on December 12, 2023</li>
+  <li>U.S. Census Bureau. "Educational Attainment." *American Community Survey, ACS 1-Year Estimates Subject Tables, Table S1501*, 2022, https://data.census.gov/table/ACSST1Y2022.S1501?q=level%20of%20education&g=010XX00US$0500000. Accessed on December 12, 2023.</li>
+  <li>U.S. Census Bureau. "Gini Index of Income Inequality." *American Community Survey, ACS 1-Year Estimates Detailed Tables, Table B19083*, 2022, https://data.census.gov/table/ACSDT1Y2022.B19083?q=gini%20index&g=010XX00US$0500000. Accessed on December 12, 2023.</li>
+</ul>
+
+The code that I used to aggregate and clean these datasets is found the folder with the original datasets. Running that code with the original datasets will entirely reproduce the aggregated and cleaned file ("election_turnout.csv") that I use for analysis in this R notebook file. 
+
+The aggregated dataset contains the following columns:
+<ul>
+  <li>geoid: the geographical id assigned to this county by the US Census Bureau</li>
+  <li>county_fips: the last five digits of the geoid, used for aggregating data from the MIT dataset</li>
+  <li>state: state name </li>
+  <li>county_name: county name </li>
+  <li>geoname: combination of the county name with the state name </li>
+  <li>turnout: the variable this analysis aims to predict -- the percent of each county's voting age population that voted in the 2020 election.</li>
+  <li>total_votes: the raw number of votes </li>
+  <li>cvap_est: the Census's estimate of the citizen voting age population (CVAP)   </li>
+  <li>dem_percent: The percent of the vote that went to the Democratic candidate, Joe Biden. </li>
+  <li>repub_percent: The percent of the vote that went to the Republican candidate, Donald Trump. </li>
+  <li>percent_bachelors_or_higher: The percent of the population over 25 that has a Bachelor's degree or higher</li>
+  <li>percent_white_alone: The percent of the CVAP that is white.</li>
+  <li>gini_index: The Gini index (to measure wealth inequality) for the county</li>
+  <li>party_of_winner: categorical variable derived from dem_percent and repub_percent, 'D' if dem_percent > repub_percent and 'R' otherwise. </li>
+</ul>
+
+Note: much of the code that I use in this analysis is code that was used in demos for this course, as well as code provided in the Bayes Rules textbook.
+
+### Procedure
+1. Exploratory data analysis -- use plots to get a sense of the relationships between turnout and other variables.
+2. Simulate model(s) using stan
+3. Model checks to make sure that the MCMC process worked.
+4. Summarize posteriors, numerically and graphically.
+5. Prediction -- posterior predictive check and predictions
+6. Model comparison
+7. Interpretation.
+
+
+### Set-up
+Import all the libraries.
+```{r setup, results=F, message=FALSE, error=FALSE, warning=FALSE}
+# Load packages
+library(ggplot2)
+library(rstanarm)
+library(rstan)
+library(bayesplot)
+library(bayesrules)
+library(tidyverse)
+library(tidybayes)
+library(broom.mixed)
+library(gridExtra)
+library(readr)
+library(broom)
+```
+
+Import the dataset.
+```{r}
+turnout <- read_csv("election_turnout.csv")
+```
+
+## 1. Exploratory Data Analysis
+
+Take a look at the dataset:
+```{r}
+head(turnout)
+```
+
+I am interested in seeing how cvap_est (population), percent_bachelors_or_higher, percent_white_alone, gini_index, and party_of_winner predict turnout. I will plot each of these variables with turnout to visually examine the relationship.
+
+```{r}
+ggplot(turnout, aes(x = percent_bachelors_or_higher, y = turnout, color = party_of_winner)) + 
+  geom_point(size = 0.5)
+```
+```{r}
+ggplot(turnout, aes(x = percent_white_alone, y = turnout, color = party_of_winner)) + 
+  geom_point(size = 0.5)
+```
+```{r}
+ggplot(turnout, aes(x = gini_index, y = turnout, color = party_of_winner)) + 
+  geom_point(size = 0.5)
+```
+```{r}
+no_outliers <- turnout %>%
+  filter(cvap_est < quantile(cvap_est, 0.95))
+
+ggplot(no_outliers, aes(x = cvap_est, y = turnout, color = party_of_winner)) + 
+  geom_point(size = 0.5)
+```
+
+Looking at these scatter plots, I see that both educational attainment (percent_bachelors_or_higher) as well as wealth inequality (gini_index) appear to have an observable relationship with turnout, while percent_white_alone and cvap_est did not have an observable relationship. Based on the plots, the categorical variable party_of_winner may provide some additional information in the relationship, so I will include it as well as percent_bachelors_or_higher and gini_index in my model.
+
+I will look at two models: one using percent_bachelors_or_higher, gini_index, and party_of_winner as explanatory variables, and one with all these variables as well as an interaction term. 
+
+
+## 2. Simulate models using stan.
+
+### Model with no interaction terms
+```{r}
+model <- stan_glm(
+  turnout ~ percent_bachelors_or_higher + gini_index + party_of_winner,
+  data = turnout, family = gaussian, 
+  prior_intercept = normal(0.4, 0.25),
+  prior = normal(0.8, 0.5, autoscale = TRUE), 
+  prior_aux = exponential(1, autoscale = TRUE),
+  chains = 4, iter = 5000*2, seed = 84735)
+```
+### Model with an interaction term
+I'm choosing to include an interaction term between gini_index and percent_bachelors_or_higher.
+```{r}
+model_interact <- stan_glm(
+  turnout ~ percent_bachelors_or_higher + gini_index + party_of_winner + percent_bachelors_or_higher:gini_index,
+  data = turnout, family = gaussian, 
+  prior_intercept = normal(0.4, 0.25),
+  prior = normal(0.8, 0.5, autoscale = TRUE), 
+  prior_aux = exponential(1, autoscale = TRUE),
+  chains = 4, iter = 5000*2, seed = 84735)
+```
+
+## 3. Model Checks
+
+### For model with no interaction term
+```{r}
+mcmc_trace(model)
+```
+
+There is no discernible trends in the trace plots for each of the variables; they all look like white noise, which is how it should be. 
+
+```{r}
+mcmc_dens_overlay(model)
+```
+
+Each of the chains for the variables produces nearly identical posterior approximations, so it appears that the simulation is stable and long enough. 
+
+```{r}
+mcmc_acf(model)
+```
+
+The autocorrelation drops off quickly and is near 0 after only a few steps, which means that the chain is mixing quickly. 
+
+```{r}
+neff_ratio(model)
+```
+These are very good! Since none of the effective sample size ratios are too low (below 10%), the model seems good on this account. 
+
+```{r}
+rhat(model)
+```
+Rhat should be very close to 1, and it is for all the variables.  
+
+### For model with interaction term
+```{r}
+mcmc_trace(model_interact)
+```
+
+The trace plots exhibit no discernible trends; all the plots look more or less like white noise, so this is an indication that the simulation worked well.
+
+```{r}
+mcmc_dens_overlay(model_interact)
+```
+
+Each of the four chains for the four models appears to estimate the posterior density consistently, so the simulation appears to be working well.
+
+```{r}
+mcmc_acf(model_interact)
+```
+
+The autocorrelation drops off quickly after a lag of about 4 or 5, which indicates that the simulation is working well. 
+
+```{r}
+neff_ratio(model_interact)
+```
+None of the effective sample size ratios are especially low (specifically, below 10%), so all appears to be good.
+
+```{r}
+rhat(model_interact)
+```
+All of the rhat values are near 1, which is how it should be.
+
+Overall, it appears that the simulations worked effectively, and both models are fine to proceed.
+
+## 4. Posterior summary
+
+### For the model with no interaction terms
+Numerical summary:
+```{r}
+tidy(model,conf.int = TRUE, conf.level=0.9)
+```
+Since none of the 90% credible intervals include 0, it appears that all these variables have some significant relationship with turnout.
+
+Some interpretation of the coefficients are as follows:
+<ul>
+  <li>intercept: when percent_bachelors_or_higher=0, gini_index=0, and party_of_winner='D', the turnout would typically be 0.8.</li>
+  <li>percent_bachelors_or_higher: when holding constant the other predictors, every one unit increase in the percent of the population with a bachelor's degree or greater typically corresponds to a 0.51 increase in the turnout.</li>
+  <li>gini_index: when holding constant the other predictors, every one unit increase in the gini index typically corresponds to a -0.68 increase in the turnout.</li>
+  <li>party_of_winnerR: when holding constant the other predictors, counties that voted Democratic (baseline) tended to have a 0.02 point higher turnout than Republican counties.</li>
+</ul>
+
+Graphical summary:  
+
+Because this multivariate linear regression has two continuous predictors, we cannot visualize the model easily with one plot. To understand the results of the model, we can visualize possible predicted regression lines for each of the variables vs turnout holding the other continuous variable constant.
+
+Holding gini_index constant:
+```{r, warning=FALSE}
+temp <- data.frame(percent_bachelors_or_higher=turnout$percent_bachelors_or_higher,gini_index=rep(mean(turnout$gini_index),length(turnout$gini_index)),party_of_winner=turnout$party_of_winner,turnout=turnout$turnout)
+
+temp %>%
+  add_fitted_draws(model, n = 50) %>%
+  ggplot(aes(x=percent_bachelors_or_higher, y=turnout, color=party_of_winner)) +
+    geom_line(aes(y = .value,  alpha = .1,
+                  group = paste(party_of_winner, .draw))) +
+    geom_point(data = temp, size = 0.1)
+```
+
+Holding percent_bachelors_or_higher constant:
+```{r, warning=FALSE}
+temp <- data.frame(percent_bachelors_or_higher=rep(mean(turnout$percent_bachelors_or_higher),length(turnout$percent_bachelors_or_higher)),gini_index=turnout$gini_index,party_of_winner=turnout$party_of_winner,turnout=turnout$turnout)
+
+temp %>%
+  add_fitted_draws(model, n = 50) %>%
+  ggplot(aes(x=gini_index, y=turnout, color=party_of_winner)) +
+    geom_line(aes(y = .value,  alpha = .1,
+                  group = paste(party_of_winner, .draw))) +
+    geom_point(data = temp, size = 0.1)
+```
+
+
+### For the model with an interaction term
+
+Numerical summary:
+```{r}
+tidy(model_interact,conf.int = TRUE, conf.level=0.9)
+```
+None of the 90% credible intervals include 0, so it appears that all these variables have some significant relationship with turnout except for the interaction term.  
+
+Some interpretation of the coefficients are as follows:
+<ul>
+  <li>intercept: when percent_bachelors_or_higher=0, gini_index=0, and party_of_winner='D', the turnout would typically be 0.66.</li>
+  <li>percent_bachelors_or_higher: when holding constant the other predictors, every one unit increase in the percent of the population with a bachelor's degree or greater typically corresponds to a 0.96 increase in the turnout.</li>
+  <li>gini_index: when holding constant the other predictors, every one unit increase in the gini index typically corresponds to a 0.35 unit decrease in the turnout.</li>
+  <li>party_of_winnerR: when holding constant the other predictors, counties that voted Democratic (baseline) tended to have a 0.02 point higher turnout than Republican counties.</li>
+  <li>percent_bachelors_or_higher:gini_index: For every one unit increase in percent_bachelors_or_higher, the effect gini_index has on turnout is more negative by 0.98. In other words, the more people who have a bachelor's degree or higher in a county, the more the amount of inequality (gini_index) negatively affects the turnout.</li>
+</ul>
+
+Graphical summary:
+As before, because this multivariate linear regression has two continuous predictors, we cannot visualize the model easily with one plot. To understand the results of the model, we can visualize the line for each of the variables vs turnout holding the other continuous variable constant.
+
+Holding gini_index constant:
+```{r, warning=FALSE}
+temp <- data.frame(percent_bachelors_or_higher=turnout$percent_bachelors_or_higher,gini_index=rep(mean(turnout$gini_index),length(turnout$gini_index)),party_of_winner=turnout$party_of_winner,turnout=turnout$turnout)
+
+temp %>%
+  add_fitted_draws(model_interact, n = 50) %>%
+  ggplot(aes(x=percent_bachelors_or_higher, y=turnout, color=party_of_winner)) +
+    geom_line(aes(y = .value,  alpha = .1,
+                  group = paste(party_of_winner, .draw))) +
+    geom_point(data = temp, size = 0.1)
+```
+
+Holding percent_bachelors_or_higher constant:
+```{r, warning=FALSE}
+temp <- data.frame(percent_bachelors_or_higher=rep(mean(turnout$percent_bachelors_or_higher),length(turnout$percent_bachelors_or_higher)),gini_index=turnout$gini_index,party_of_winner=turnout$party_of_winner,turnout=turnout$turnout)
+
+temp %>%
+  add_fitted_draws(model, n = 50) %>%
+  ggplot(aes(x=gini_index, y=turnout, color=party_of_winner)) +
+    geom_line(aes(y = .value,  alpha = .1,
+                  group = paste(party_of_winner, .draw))) +
+    geom_point(data = temp, size = 0.1)
+```
+
+## 5. Predictions: posterior predictive check and predictions at new set of x values
+
+### For the model without the interaction term
+```{r}
+pp_check(model)
+```
+
+The idea of posterior predictive checking is that if the model assumptions are reasonable, then the posterior model should simulate data that is similar to the actual observations. In this case, the model fits well with the data -- the density of the model appears to be similar to the density of the actual data. The center of the model density is not exactly even with data center, and there appears to be some slight bimodality that is not captured by the model, but overall the model does a reasonably good job. 
+
+### For the model with the interaction term
+```{r}
+pp_check(model_interact)
+```
+
+As before, it appears that the model fits reasonably well with the data, and that the density of the model matches the density of the data. Again, there is some slight bimodality that the model is not capturing, but the model we have is a reasonable approximation.
+
+### A prediction for the model without the interaction term
+```{r}
+prediction <- 
+  posterior_predict(model, newdata = data.frame(percent_bachelors_or_higher=0.5,gini_index=0.5,party_of_winner='D'))
+
+# describing the posterior predictive model for this set of values
+mean(prediction)
+median(prediction)
+sd(prediction)
+posterior_interval(prediction, prob = 0.95)
+```
+What this prediction means is that the model predicts that for a Democratic county (based on the party of the winner) where 50% of the population over 25 has a bachelor's degree or higher and a Gini index of 0.5, the turnout will be 72.5%. 
+
+```{r}
+mcmc_dens(prediction) + xlab("Predicted turnout for 50% bachelor's degree or higher and 0.5 gini index, and party of winner being D")
+```
+
+### A prediction for the model with an interaction term
+
+```{r}
+prediction <- 
+  posterior_predict(model_interact, newdata = data.frame(percent_bachelors_or_higher=0.5,gini_index=0.5,party_of_winner='D'))
+
+# describing the posterior predictive model for this set of values
+mean(prediction)
+median(prediction)
+sd(prediction)
+posterior_interval(prediction, prob = 0.95)
+```
+
+What this prediction means is that the model predicts that for a Democratic county (based on the party of the winner) where 50% of the population over 25 has a bachelor's degree or higher and a Gini index of 0.5, the turnout will be 71.9%. 
+
+```{r}
+mcmc_dens(prediction) + xlab("Predicted turnout for 50% bachelor's degree or higher and 0.5 gini index, and party of winner being D")
+```
+
+
+## 6. Model Comparison
+
+### For the model with no interaction term
+```{r}
+set.seed(42)
+cv_procedure <- prediction_summary_cv(model = model, data = turnout, k = 10)
+```
+
+
+```{r}
+cv_procedure$folds
+cv_procedure$cv
+```
+
+Around 53.3% of the observed y_i's fell within the 50% posterior prediction interval and 96% with the 95% posterior prediction interval for the model without an interaction term. 
+
+### For the model with an interaction term
+
+```{r}
+set.seed(42)
+cv_procedure <- prediction_summary_cv(model = model_interact, data = turnout, k = 10)
+```
+
+
+```{r}
+cv_procedure$folds
+cv_procedure$cv
+```
+
+Around 53.0% of the observed y_i's fell within the 50% posterior prediction interval and 95.8% with the 95% posterior prediction interval for the model without an interaction term.
+
+```{r}
+model_elpd <- loo(model)
+model_elpd$estimates
+```
+
+```{r}
+model_interact_elpd <- loo(model_interact)
+model_interact_elpd$estimates
+```
+```{r}
+loo_compare(model_elpd,model_interact_elpd)
+```
+
+Based on these metrics, I can make some comparisons between the models to determine which is better for this situation. The model without an interaction term performs very slightly better with cross validation with 96% of the observed y_i's falling within the 95% posterior prediction interval compared with the interaction model's 95.8%. If we look at the ELPD, though, we see that the interaction model performed nearly significantly better -- the difference in ELPD between the interaction model and the model was 3.3 (with a standard deviation of 1.7) and $-3.3+(2*1.7)$ is just barely above 0, meaning that an ELPD of 0 is just barely within two standard deviations. In other words, based on ELPD, the interaction model is better than the original model, but not by an extreme amount.
+
+I conclude that the interaction model somewhat outperforms the original because though the original was slightly better when looking at the posterior prediction intervals, it was not by a significant amount, and the interaction model scores better based on ELPD. 
+
+## 7. Interpretation
+
+### Are the slopes of the interaction model different than 0? 
+
+I looked at this when interpreting the tidy() results for both of the models by seeing whether 0 was within the 90% credible interval for the coefficients, and I saw that none of the coefficients had 0 in the corresponding credible interval. However, this is not a precise method, so I will estimate the probability of the coefficients are different than 0 by seeing the proportion of them that did in the simulation.
+
+I expect that a higher educational attainment predicts a higher election turnout, so I want to estimate $Pr(\beta_1 > 0 \mid y)$:
+
+```{r}
+model_interact_df = as.data.frame(model_interact)
+temp = model_interact_df %>% 
+  mutate(exceeds_0 = percent_bachelors_or_higher > 0)
+table(temp$exceeds_0)
+```
+So our estimate is $Pr(\beta_1 > 0 \mid y)$=1, meaning that not a single one of the draws resulted in a $\beta_1 <= 0$.  
+
+I repeat this process for the other coefficients:
+
+I expect that a higher level of wealth inequality (gini_index) predicts a lower election turnout, so I'm interested in estimating $Pr(\beta_2 < 0 \mid y)$:
+```{r}
+temp = model_interact_df %>% 
+  mutate(exceeds_0 = gini_index < 0)
+table(temp$exceeds_0)
+```
+The estimate is $Pr(\beta_2 < 0 \mid y)$=0.981, which is very high.
+
+
+The predicted coefficient for the difference in turnout between counties voting Democratic vs Republican is positive, so I am curious about the proportion of the simulations where this is true, so I look at $Pr(\beta_3 > 0 \mid y)$:
+```{r}
+temp = model_interact_df %>% 
+  mutate(exceeds_0 = party_of_winnerR > 0)
+table(temp$exceeds_0)
+```
+The estimate is $Pr(\beta_3 > 0 \mid y)$=0.996, which is very high.
+
+The predicted coefficient for the interaction term between educational attainment and wealth inequality was negative, so I will estimate $Pr(\beta_4 < 0 \mid y)$:
+```{r}
+temp = model_interact_df %>% 
+  mutate(exceeds_0 = 'percent_bachelors_or_higher:gini_index' < 0)
+table(temp$exceeds_0)
+```
+The estimate is $Pr(\beta_4 < 0 \mid y)$=1.
+
+What these estimates mean is that all of the coefficients are most likely different than 0 in the direction that I would expect, and they are statistically significant. This means that I am very certain that there is some relationship between each of the variables and election turnout. 
+
+
+I successfully built two models that capture the relationship between election turnout and educational attainment, wealth inequality, and political party. Both of these models illustrate that holding other variables constant, in general, counties with a higher educational attainment (measured by percent of the population over 25 with a bachelor's degree or higher) have a higher election turnout, counties with greater wealth inequality (a higher Gini index) tend to have a lower election turnout, and counties that voted Democratic tend to have a slightly higher turnout rate than counties that voted Republican.
+
+From a political science perspective, this is interesting: understanding what factors predict election turnout for a district (in this case, a county) is important to getting a general comprehension of the political landscape of an area. Though this analysis doesn't explain exactly *why* some places have lower turnout than others, it reveals some characteristics that have a statistically significant relationship with election turnout. 
+
+
+
+
+
+## Honor Pledge
+**On my honor, I have neither received nor given any unauthorized assistance on this project.**
+* SIGNED: Eva Allred *
+
+
+
+
+
